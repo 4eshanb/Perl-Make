@@ -1,0 +1,503 @@
+#!/usr/bin/perl -w
+
+# Eshan Bhargava and esbharga@ucsc.edu
+
+#
+use Getopt::Std;
+use Data::Dumper;
+use POSIX qw(strftime);
+
+use strict;
+use warnings;
+
+my $debugFlag = 0;
+my @inputTargets;
+my %graph;
+my @commandsStack;
+my %commandHash;
+my $currTarget = "";
+my %macroHash;
+my @lines;
+
+sub mtime ($) {
+    my ($filename) = @_;
+    my @stat = stat $filename;
+    return @stat ? $stat[9] : undef;
+}
+
+sub fileinfo ($) {
+    my ($filename) = @_;
+    my $mtime = mtime $filename;
+  #  print "$filename: ";
+    if ( defined $mtime ) { print strftime "%c\n", localtime $mtime }
+    else                  { print "$!\n" }
+    return $mtime;
+}
+
+sub parse_args {
+
+    # declare the perl command line flags/options we want to allow
+    my %options = ();
+    getopts( "d", \%options );
+
+    # test for the existence of the options on the command line.
+    print "-d $options{d}\n" if defined $options{d};
+
+    $debugFlag = 1 if defined $options{d};
+
+    # other things found on the command line
+    #  print "Other things found on the command line:\n" if $ARGV[0];
+    foreach (@ARGV) {
+        push( @inputTargets, $_ );
+    }
+
+    #    push( @inputTargets, "all" ) if not $ARGV[0];
+    if ( $debugFlag == 1 ) {
+        foreach (@inputTargets) {
+            print "DEBUG: input args are $_\n";
+        }
+    }
+}
+
+sub read_make {
+    open( DATA, "<Makefile" ) or die "could not open Makefile, $!";
+    my @tmp = <DATA>;
+    close DATA;
+    return @tmp;
+}
+
+sub parse_dep($) {
+    my ($line) = @_;
+    return undef unless $line =~ m/^(\S+)\s*:\s*(.*?)\s*$/;
+    my ( $target, $dependency ) = ( $1, $2 );
+    $target = expandMacro($target);
+    my @result;
+    @result = expandMacro( $dependency, @result );
+
+    my @dependencies = split m/\s+/, $dependency;
+
+    return $target, \@result;
+}
+
+sub checkTimesForDependencies {
+    my $n      = scalar(@_);
+    my $target = $_[0];
+    my (@deps) = $graph{$target};
+    my $tmp    = pop @deps;
+
+    #  print "11target = $target\n";
+    #  print "11deps = ", Dumper($tmp);
+    my $ret = 2;
+
+    foreach my $file (@$tmp) {
+
+        #    print "AAAAAAA $file\n";
+        $ret = 0;
+        my $mtime = mtime $target;
+        if ( defined $mtime ) {
+            my $ctime = strftime "%c", localtime $mtime;
+            printf "target %-20s %12d\n", $target, $mtime if $debugFlag;
+
+        }
+        else {
+            $mtime = -1;
+            $ret   = 2;
+        }
+
+        my $mtimeDep = mtime $file;
+        if ( defined $mtimeDep ) {
+            printf "   dep %-20s %12d \n", 
+                $file, $mtimeDep if $debugFlag;
+            if ( $mtime < $mtimeDep ) {
+                $ret = 1;
+            }
+        }
+        else {
+            $ret = 2;
+        }
+    }
+    print "returning $ret\n" if $debugFlag;
+    return $ret;
+
+}
+
+sub displayTargetsInMake {
+    print "targets in make: ";
+    foreach ( keys %graph ) {
+        print "$_, ";
+    }
+    print "\n";
+}
+
+sub invalidTarget {
+    print "pmake.perl: *** No rule to make target \`$_[0]\`. Stop\n";
+
+    #    displayTargetsInMake;
+    exit 1;
+}
+
+sub errorTarget {
+    print "pmake.perl: ***  \`$_[0]\`. Error 1\n";
+
+    #    displayTargetsInMake;
+    exit 1;
+}
+
+sub processCommandStack {
+    my @target = @_;
+    if ( exists $commandHash{ $target[0] } ) {
+        my $statement = $commandHash{ $target[0] };
+        if ( $statement =~ m/\;/ ) {
+            foreach ( split ';', $statement ) {
+                my $cmd = $_;
+                processSingleCommand( $cmd, $target[0] );
+            }
+        }
+        else {
+            processCommand(@target);
+        }
+    }
+
+}
+
+sub processSingleCommand {
+    my ( $statement, $target ) = @_;
+
+    #       print "processCommand: :$statement:" , "\n" ;
+
+    if ( $statement =~ m/^\t@/ or $statement =~ m/^@/ ) {
+        my ( $char, $cmd ) = split /@/, $statement;
+
+        #  print "\n before: $cmd\n";
+        $cmd =~ s/\$\$/\$/g;
+
+        #  print "$cmd\n";
+        system($cmd) == 0 or errorTarget($target);
+    }
+    elsif ($statement =~ m/^\t-/
+        or $statement =~ m/^-/
+        or $statement =~ m/(\s+)-/ )
+    {
+        my ( $char, $cmd ) = split /\-/, $statement;
+        $cmd =~ s/^\s+//;
+
+        #  print "\n before: $cmd\n";
+        $cmd =~ s/\$\$/\$/g;
+        print "$cmd\n";
+        system($cmd) == 0
+          or print "pmake:[", $target, "] Error 1 (ignored)\n";
+
+    }
+    else {
+        $statement =~ s/^\s+//;
+        $statement =~ s/\$\$/\$/g;
+        print "$statement\n";
+
+        system($statement) == 0 or errorTarget($target);
+
+    }
+}
+
+sub processCommand {
+
+    my @target = @_;
+
+    # print "processCommand: @target" , "\n";
+
+    if ( exists $commandHash{ $target[0] } ) {
+        my $statement = $commandHash{ $target[0] };
+
+        #       print "processCommand: :$statement:" , "\n" ;
+
+        if ( $statement =~ m/^\t@/ or $statement =~ m/^@/ ) {
+            my ( $char, $cmd ) = split /@/, $statement;
+            $cmd =~ s/\$\$/\$/g;
+            system($cmd) == 0 or errorTarget( $target[0] );
+        }
+        elsif ( $statement =~ m/^\t-/ or $statement =~ m/^-/ ) {
+            my ( $char, $cmd ) = split /\-/, $statement;
+            $cmd =~ s/^\s+//;
+            $cmd =~ s/\$\$/\$/g;
+            print "$cmd\n";
+            system($cmd) == 0
+              or print "pmake:[", $target[0], "] Error 1 (ignored)\n";
+
+        }
+        else {
+            $statement =~ s/^\s+//;
+            $statement =~ s/\$\$/\$/g;
+            print "$statement\n";
+
+            system($statement) == 0 or errorTarget( $target[0] );
+
+        }
+
+    }
+
+}
+
+sub expandMacro {
+    my ($target) = @_;
+    my $ret = $target;
+    if ( $target =~ m/\$\{(.*)\}/ ) {
+        my $key = $1;
+        if ( exists( $macroHash{$key} ) ) {
+            $ret = $macroHash{$key};
+        }
+    }
+    $ret =~ s/^\s+|\s+$//g;
+    return $ret;
+}
+
+sub targetWithPercApplicable {
+    my ( $target, $dep ) = @_;
+    if (m/(\w+)\.(\w+)/) {
+        my ( $fileNamePrefix, $fileNameSuffix ) = ( $1, $2 );
+        if ( exists $graph{"%.${fileNameSuffix}"} ) {
+            my $preq = $graph{"%.${fileNameSuffix}"};
+            my ($tmp) = @$preq;
+            if ( $tmp =~ m/^%\.(\w+)/ ) {
+                my $fileName = "${fileNamePrefix}.$1";
+                my $cmdKey = "%.${fileNameSuffix}";
+                my $cmd = $commandHash{$cmdKey};
+                $cmd =~ s/\$\</$fileName/g;
+                $cmd =~ s/\$\$/\$/g;
+                system($cmd);
+                $commandHash{$dep} = $cmd;
+            }
+            else {
+                print "Unexpected Error: failed $tmp\n";
+            }
+        }
+    }
+}
+
+sub processTarget {
+    my $target = $_;
+    my (@deps) = $graph{$target};
+    my $tmp    = pop @deps;
+    my $skip   = 0;
+    my $str = @$tmp[0];
+
+    foreach ( split ' ', $str ) {
+        my $dep = $_;
+        targetWithPercApplicable( $target, $dep );
+        if ( exists( $graph{$dep} ) ) {
+            processTarget($dep);
+        }
+        else {
+            # check to see if its a file.
+            # if depency is a file, 
+            # get the timestamp and compare it with target
+            # also there we can have multiple files.
+            my $ret = checkTimesForDependencies($target);
+            if ( $ret == 1 ) {
+                processCommandStack($target);
+                $skip = 1;
+            }
+        }
+    }
+    my $processCommandFlag = 0;
+    my $ret                = checkTimesForDependencies($target);
+    if ( $skip == 0 ) {
+        if ( $ret == 1 or $ret == 2 ) {
+            processCommandStack($_);
+            $processCommandFlag = 1;
+        }
+        elsif ( $ret == 0 and $processCommandFlag == 0 ) {
+            print "pmake: $target  is up to date\n";
+        }
+        else { }
+    }
+    else {
+        print "pmake: $target  is up to date\n" if $ret == 1;
+
+    }
+}
+
+sub expandMacroValue {
+    my ( $value, @result ) = @_;
+    my @words = split / /, $value;
+
+    for my $word (@words) {
+        $word =~ s/^\s+|\s+$//g;
+        if ( $word =~ m/\${0,1}\{(.*)\}/ ) {
+            my $key = $1;
+            if ( exists( $macroHash{$key} ) ) {
+                my $val = $macroHash{$key};
+                @result = expandMacroValue( $val, @result );
+            }
+        }
+        else {
+            push( @result, $word );
+        }
+    }
+    return @result;
+}
+
+sub debugInfo {
+    print "Graph of dependencies\n", Dumper( \%graph ) if $debugFlag;
+    print "-------------------------\n" if $debugFlag;
+
+    #print "Command Stack \n", Dumper( \@commandsStack ) if $debugFlag;
+
+    #print "-------------------------\n" if $debugFlag;
+
+    print "Command Hash \n", Dumper( \%commandHash )  if $debugFlag;
+    print "input targets\n", Dumper( \@inputTargets ) if $debugFlag;
+    print "marco hash\n ",   Dumper( \%macroHash )    if $debugFlag;
+
+}
+
+#pare the makefile into two data structures
+# first is dict/hashtable of @inputTargets
+# a stack of commands to be executed.
+
+sub parseMakeFile {
+    foreach (@lines) {
+
+      if (/^\s+$/) {    #limes have
+            ;
+      }
+      elsif (/^\s*#/) {    #lines beginging wih #
+            ;
+      }
+      else 
+      {
+         my ($line) = $_;
+         if ( $line =~ m/^(\S+)\s*:\s*(.*?)\s*$/ ) 
+         {    #parse targets
+
+                my ( $target, $deps ) = parse_dep $line;
+                $graph{$target} = $deps;
+                $currTarget = $target;
+
+                #      print "INIT $currTarget\n";
+                # Put the first target as default, if there was none on
+                # cmd line.
+                if ( scalar(@inputTargets) == 0 ) {
+                    push( @inputTargets, $target );
+                }
+
+         }
+         elsif ( $line =~ m/^\t(\S+)/ ) 
+         {    # lines begining with tab
+                    #  print "\t TBD we need to execute this  $_\n";
+                    #  print "target = $currTarget \n";
+                my @res;
+                @res = expandMacroValue( $_, @res );
+                my $str = join " ", @res;
+                my $prevCommand;
+                if ( exists $commandHash{$currTarget} ) {
+                    $prevCommand = $commandHash{$currTarget};
+                }
+                push( @commandsStack, $str );
+
+                if ( $currTarget eq "test" ) {
+                    $str = "./${str}";
+                }
+                if ( defined $prevCommand ) {
+                    my $tmp = "${prevCommand} ; ${str}";
+                    $commandHash{$currTarget} = $tmp;
+                }
+                else {
+                    $commandHash{$currTarget} = $str;
+                }
+        }
+        elsif($line =~ m/(\w+)(\s+)=(\s+)[\$|-]{0,1}[\{]{0,1}(\w+)/ ) 
+        {
+                $line =~ m/^(.*) = (.*)$/;
+                my ( $key, $value ) = ( $1, $2 );
+                my @result;
+                @result = expandMacroValue( $value, @result );
+                my $str = join " ", @result;
+                $str =~ s/^\s+|\s+$//g;
+                $key =~ s/^\s+|\s+$//g;
+                $macroHash{$key} = $str;
+        }
+        else {
+                print "Unexpected : got something else $line ; \n";
+            }
+        }
+    }
+}
+
+sub run {
+    foreach (@inputTargets) {
+        my $target = $_;
+
+ #  print "checking for target:$target:
+ # against defined targets in make file\n";
+
+        my $tmp = $graph{$target};
+
+        #    print "Graph of dependencies\n",
+        #    Dumper($tmp ) if $debugFlag;
+        #    print "Exists \n" if exists $graph{$target};
+        #    print "Defined \n" if defined $graph{$target};
+        #    print "True\n" if $graph{$target};
+        if ( exists $graph{$target} ) {
+            processTarget $target;
+        }
+        else {
+            invalidTarget $target;
+        }
+    }
+}
+
+sub expandPercentRule {
+    my $suffix;
+    my $cmd;
+    while ( my ( $k, @v ) = each %graph ) {
+        if ( $k =~ /^\%/ ) {
+            $suffix = $k;
+            $suffix =~ s/^%//;
+            $cmd = $commandHash{$k};
+
+            #        print "suffix=$suffix k=$k cmd=$cmd \n";
+
+        }
+    }
+
+    if ( defined $suffix ) {
+
+        while ( my ( $key, @deps ) = each %graph ) {
+            my $tmp = $key;
+
+            #    print "here $tmp suffix = $suffix\n";
+            if ( $tmp =~ /^%/ ) {
+                $tmp =~ s/^%//;
+
+                #    print "Java $key $tmp\n";
+            }
+            elsif ( $tmp =~ /^(\w+)/ ) {
+                $tmp =~ s/^(\w+)//;
+                my $files = $deps[0];
+                my @filesArray = split " ", @$files[0];
+
+                #    print "SSS $key $tmp\n";
+                if ( $tmp eq $suffix ) {
+
+                    my $tmpCmd = $cmd;
+
+                    #        $tmpCmd =~ s/\$<$/@$files[0]/;
+                    $tmpCmd =~ s/\$<$/$filesArray[0]/;
+
+                    #        print "and are command is $tmpCmd\n";
+                    $commandHash{$key} = $tmpCmd;
+                }
+
+            }
+
+        }
+    }
+
+}
+
+#main
+parse_args;
+@lines = read_make;
+parseMakeFile;
+debugInfo if $debugFlag;
+expandPercentRule;
+run;
